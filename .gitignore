@@ -1,0 +1,8 @@
+node_modules/
+*.log
+.brain/lock/
+.brain/audit.jsonl
+memories/
+!memories/.gitkeep
+__pycache__/
+.DS_Store

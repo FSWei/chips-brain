@@ -1,0 +1,7 @@
+name: brain-gate
+version: 0.1.0
+description: >-
+  Hermes write gate for chips-brain: every memory tool write is checked by
+  brain.js at the store level (covers add and apply_batch). Failure = passthrough.
+author: FSWei
+hooks: []

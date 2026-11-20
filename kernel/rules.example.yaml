@@ -1,0 +1,43 @@
+# agent-brain 写入规则（Hermes 与 DSH 共读，唯一契约）
+# 改了这里，两边同时生效；不要在插件里硬编码这些值。
+version: 1
+
+files:
+  MEMORY.md:
+    path: memories/MEMORY.md
+    char_limit: 2200        # 与 Hermes config 的 memory_char_limit 保持一致
+    entry_max: 150          # 单条索引长度上限，超了说明该写进 skill
+    writable: true
+  USER.md:
+    path: memories/USER.md
+    char_limit: 1375
+    entry_max: 200
+    writable: true
+  SOUL.md:
+    path: SOUL.md
+    char_limit: 4000
+    entry_max: 4000
+    writable: false         # 人格文件只由人改，agent 只读
+
+separator: "\n§\n"          # 条目分隔符：单独一行 §
+
+# 写入前扫描，命中即拒（正则，大小写敏感）
+forbid_patterns:
+  - "sk-[A-Za-z0-9]{20,}"
+  - "ghp_[A-Za-z0-9]{30,}"
+  - "github_pat_[A-Za-z0-9_]{20,}"
+  - "AKIA[0-9A-Z]{16}"
+  - "xox[baprs]-[A-Za-z0-9-]{10,}"
+  - "-----BEGIN [A-Z ]*PRIVATE KEY-----"
+  - "Bearer [A-Za-z0-9._-]{20,}"
+
+lock:
+  dir: .brain/lock
+  stale_seconds: 60         # 超过这个时间未释放，视为残留并清理
+
+audit: .brain/audit.jsonl   # 只追加：谁在何时改了什么
+
+# 记忆是索引，不是仓库：正文超过 entry_max 时，正确做法是新建 skill 再写一行索引
+policy:
+  memory_is_index_only: true
+  detail_goes_to: skills
