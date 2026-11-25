@@ -1,22 +1,26 @@
 # agent-brain 写入规则（Hermes 与 DSH 共读，唯一契约）
 # 改了这里，两边同时生效；不要在插件里硬编码这些值。
-version: 1
+# ⚠️ brain.js 在 require 时一次性读入本文件：改完必须重启宿主进程（CLI 每次重读，不受影响）。
+version: 2
 
 files:
   MEMORY.md:
     path: memories/MEMORY.md
     char_limit: 2200        # 与 Hermes config 的 memory_char_limit 保持一致
-    entry_max: 150          # 单条索引长度上限，超了说明该写进 skill
+    entry_max: 150          # 单条索引长度上限，超了说明该写进正文文件
+    short_fact_max: 80      # 无指针的短事实：允许直接落记忆的最大长度
     writable: true
   USER.md:
     path: memories/USER.md
     char_limit: 1375
     entry_max: 200
+    short_fact_max: 200     # 画像是自包含描述，不要求指针
     writable: true
   SOUL.md:
     path: SOUL.md
     char_limit: 4000
     entry_max: 4000
+    short_fact_max: 4000
     writable: false         # 人格文件只由人改，agent 只读
 
 separator: "\n§\n"          # 条目分隔符：单独一行 §
@@ -37,7 +41,21 @@ lock:
 
 audit: .brain/audit.jsonl   # 只追加：谁在何时改了什么
 
-# 记忆是索引，不是仓库：正文超过 entry_max 时，正确做法是新建 skill 再写一行索引
-policy:
-  memory_is_index_only: true
-  detail_goes_to: skills
+# 记忆是索引，不是仓库：正文写进技能或正文文件，记忆里只留一行 + 指针
+shapes:
+  pointer_required: true    # 超过 short_fact_max 且无指针 → 拒（unindexed_detail）
+  max_pointers: 1           # 一条索引最多一个指针
+
+pointer:
+  roots:                    # file: 指针只允许指向这两个根之下
+    - memories/records
+    - skills
+  skill_prefix: "skill:"
+  file_prefix: "file:"
+
+records:
+  dir: memories/records     # 跨技能共享的正文（白名单：≥2 个技能共用，或单文件 >20K 字符）
+
+limits:
+  skill_soft_chars: 15000   # doctor 提示线
+  skill_hard_chars: 20000   # 上游作者规范线，doctor 标红

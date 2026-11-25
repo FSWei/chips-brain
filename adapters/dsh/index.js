@@ -82,36 +82,35 @@ const provider = {
     return list(target);
   },
 
+  // 2026-11-24：整批交给 brain.applyOps —— 同一把锁内「全部校验通过才落盘」，
+  // 任何一条失败则整批不改（旧实现逐条应用，remove 之后 add 被拒会静默丢条目）。
   async applyBatch(target, operations) {
+    const file = FILE_KEY[target];
     const ops = Array.isArray(operations) ? operations : [];
-    const messages = [];
-    for (const op of ops) {
-      try {
-        const r = applyOne(target, op);
-        messages.push(r.message || `${op.action} ok`);
-      } catch (e) {
-        const entries = list(target);
-        const lim = limits(target);
-        const extra = e.extra || {};
-        const pending = extra.pending_id ? `（已登记 pending #${extra.pending_id}；可选 force 强写，或精简后重试）` : '';
-        return {
-          ok: false,
-          message: `[chips-brain] ${e.code || 'error'}: ${e.message}${pending}（已应用 ${messages.length}/${ops.length} 条；整批非原子）`,
-          entries,
-          chars: entries.join('\n§\n').length,
-          limit: lim.chars,
-        };
-      }
+    try {
+      const r = brain.applyOps({ file, ops });
+      const entries = list(target);
+      const archived = r.archived ? `（超预算归档 ${r.archived} 条）` : '';
+      return {
+        ok: true,
+        message: `已应用 ${r.applied}/${ops.length} 条${archived}`,
+        entries,
+        chars: r.chars,
+        limit: r.limit,
+      };
+    } catch (e) {
+      const entries = list(target);
+      const lim = limits(target);
+      const extra = e.extra || {};
+      const pending = extra.pending_id ? `（已登记 pending #${extra.pending_id}；可选 force 强写，或精简后重试）` : '';
+      return {
+        ok: false,
+        message: `[chips-brain] ${e.code || 'error'}: ${e.message}${pending}`,
+        entries,
+        chars: entries.join('\n§\n').length,
+        limit: lim.chars,
+      };
     }
-    const entries = list(target);
-    const lim = limits(target);
-    return {
-      ok: true,
-      message: messages.join('；') || 'no-op',
-      entries,
-      chars: entries.join('\n§\n').length,
-      limit: lim.chars,
-    };
   },
 
   async snapshot() {
@@ -143,8 +142,9 @@ const provider = {
     if (!parts.length) return '';
     return [
       `[chips-brain] 共享记忆（Chips 的大脑，根目录 ${ROOT}）。` +
-        '索引 memories\\MEMORY.md、画像 memories\\USER.md、技能 skills\\<name>\\SKILL.md。' +
-        '写入只写索引级一行（≤150 字），细节进 skill；不要用 write/edit 直接改 memories/ 或 skills/。',
+        '索引 memories\\MEMORY.md、画像 memories\\USER.md；正文在 skills\\<名>\\references\\ 与 memories\\records\\。' +
+        '写入只写一行：≤80 字的自包含短事实，或「一句话结论 + 指针」（见 skill <名> ／ → memories/records/<域>/<主题>.md），指针必须真实存在。' +
+        '不要用 write/edit 直接改 memories/ 或 skills/。',
       ...parts,
     ].join('\n\n');
   },

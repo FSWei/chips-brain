@@ -1,7 +1,7 @@
 {
   "name": "@chips/dsh-memory-provider",
-  "version": "0.1.0",
-  "description": "chips-brain memory provider for DSH evolution — delegates every read/write to D:\\agent-brain\\.brain\\bin\\brain.js (same lock, rules and audit as Hermes/MIS)",
+  "version": "0.2.0",
+  "description": "chips-brain memory provider for DSH evolution — delegates every read/write to <brain>/.brain/bin/brain.js (same lock, rules and audit as Hermes/MIS)",
   "type": "module",
   "main": "index.js",
   "license": "MIT"

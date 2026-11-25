@@ -1,49 +1,109 @@
-// brain-policy.js — MIS 语义的 JS 端口（brain.js 与 DSH provider 共用）
+// brain-policy.js — 记忆写入策略（brain.js 与 DSH provider 共用，唯一实现）
 //
-// 来源：Hermes 插件 plugins/mis/__init__.py 的 _check_mis_policy_v2 /
-// _find_duplicate / _find_dead_references / _extract_topic / _similarity_ratio。
-// 目的：让 DSH（evolution + chips-memory provider）与 Hermes（MIS）执行同一套
-// 「记忆只存一行索引、细节进 skill」的规则，而不是各写一套。
+// 2026-11-24 重构：从「形状过滤」改为「三种合法写入形状」。
+//   ① 短自包含事实：≤ short_fact_max，单行，无指针
+//   ② 索引行：单行、≤ entry_max、含且仅含一个可解析指针（skill:xxx 或 file:path）
+//   ③ 画像：USER.md，用 short_fact_max=200 放行
+// 其余一律拒（unindexed_detail）。凭据 / IP / 端口仍无条件硬拦，索引行也不放行。
 //
-// 注意：MIS 原实现里部分正则把 \s 误写成了 \\s（字面反斜杠），这里按「意图」
-// 实现为 \s；两者的差异只影响"结构化内容"的识别范围，行为更接近设计文档。
+// 保留的旧机制：硬规则、相似度查重、项目堆积（防止「一条条短事实」把记忆塞满）、死引用。
 'use strict';
 
 const fs = require('fs');
 const path = require('path');
 
-const INDEX_LINE_RE = /^\s*§\s*.+\S\s*[：:]?\s*(?:详见|see)\s*(?:skill|gbrain\s+page)\s+\S+/i;
-
-const REFERENCE_PATTERNS = [
-  [/(?:^|\n)\s*[-•·]\s+/m, 'bullet list'],
-  [/(?:^|\n)\s*\d+[.)、]\s+/m, 'numbered list'],
-  [/→|=>|：.*→/, 'arrow/chain notation'],
-  [/(?:步骤|step)\s*\d/i, 'step-by-step'],
-  [/(?:首先|然后|接着|最后|其次)/, 'sequential flow'],
-  [/(?:第[一二三四五六七八九十]+步)/, 'numbered steps'],
-  [/\|.*\|.*\|/, 'table structure'],
-  [/(?:详见|参考|see)\s+(?!skill\s|gbrain\s+page)/, 'references non-skill'],
+// ---------------------------------------------------------------- 硬规则（无条件拦）
+// 凭据 / IP / 端口：MEMORY.md 每轮全量注入给模型供应商，短行里的密码同样出网。
+const HARD_DOMAIN_PATTERNS = [
+  [/(?<![\w.-])(?:\d{1,3}\.){3}\d{1,3}(?![\w.-])/, 'IP 地址'],
+  [/(?:密码|口令|password|passwd|pwd|token|secret|api[\s_-]?key|私钥|凭据|credentials?)\s*[：:=]\s*\S+/i, '凭据'],
+  [/(?:端口|port)\s*[：:=]?\s*\d{2,5}(?!\d)/i, '端口号'],
 ];
 
-const DOMAIN_PATTERNS = [
-  [/(?:服务器|server)\s*(?:IP)?\s*[：:]?\s*\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/i, 'server IP'],
-  [/(?:技术栈|tech\s*stack)\s*[：:]/i, 'tech stack'],
-  [/(?:架构|architecture)\s*[：:]\s*\S/i, 'architecture'],
-  [/(?:数据库|database|DB)\s*[：:]\s*\S/i, 'database'],
-  [/(?:部署|deploy)\s*[：:]\s*\S/i, 'deployment'],
-  [/(?:API|端点|endpoint)\s*[：:]\s*\S/i, 'API endpoint'],
-  [/(?:端口|port)\s*[：:]?\s*\d{2,5}/i, 'port number'],
-  [/(?:密码|password|token|secret|api.?key)\s*[：:]\s*\S/i, 'credential'],
-  [/(?:表结构|schema|字段|column)\s*[：:]/i, 'database schema'],
-  [/(?:路由|route)\s*[：:]\s*\/\S/i, 'API route'],
-  [/(?:组件|component)\s*[：:]\s*\S{10,}/i, 'component details'],
-  [/(?:脚本|口播|文案|剧本|解说词)[^：:\n]*[：:]/i, 'content creation'],
-  [/(?:封面|排版|设计风格|配色|色调)[^：:\n]*[：:]/i, 'design spec'],
-  [/(?:视频|剪辑|字幕|配音|特效)[^：:\n]*[：:]/i, 'video production'],
-  [/(?:推广|营销|获客|转化|漏斗)[^：:\n]*[：:]/i, 'marketing'],
-  [/(?:简历|resume|工作经历|教育背景)[^：:\n]*[：:]/i, 'resume'],
-];
+// 项目细节堆积：一条条短事实也能把 MEMORY 塞满。同一个大写项目代号已 ≥5 条 → 拒。
+const PILEUP_THRESHOLD = 5;
+const PILEUP_DENY = new Set([
+  'USB', 'GPIO', 'PID', 'API', 'JSON', 'UTF', 'GBK', 'HTML', 'PDF', 'IP', 'CPU', 'RAM', 'GPU', 'OK', 'AI', 'LLM',
+  'STM32', 'CH340', 'PWM', 'TXT', 'CSV', 'MQTT', 'CLI', 'GUI', 'SDK', 'FPS', 'CDN', 'DNS', 'TLS', 'SSL',
+  'HTTP', 'HTTPS', 'URL', 'URI', 'SQL', 'JWT', 'WSL', 'NDA', 'FAQ', 'TODO', 'TBD', 'EOF', 'UTF8', 'UTF16',
+]);
 
+// ---------------------------------------------------------------- 指针
+// 索引行必须能把读者带到正文。两种目标：
+//   skill:<name>                       → skills/**/<name>/SKILL.md
+//   file:<path> / → <path>             → 相对 brain 根，必须落在 pointer.roots 之下且存在
+const SKILL_REF_RE = /(?:详见|参见|见|see)\s+skill\s*[:：]?\s*([\p{L}\p{N}_-]+)/giu;
+const FILE_REF_RE = /(?:详见|参见|见|see|→|->)\s*(?:file\s*[:：]\s*)?((?:memories|skills)[/\\][^\s，。；、,;()（）「」]+?\.md)/giu;
+
+function findPointers(text) {
+  const out = [];
+  const push = (kind, target) => {
+    if (!out.some((p) => p.kind === kind && p.target === target)) out.push({ kind, target });
+  };
+  let m;
+  SKILL_REF_RE.lastIndex = 0;
+  while ((m = SKILL_REF_RE.exec(text)) !== null) push('skill', m[1]);
+  FILE_REF_RE.lastIndex = 0;
+  while ((m = FILE_REF_RE.exec(text)) !== null) push('file', m[1].replace(/\\/g, '/'));
+  return out;
+}
+
+function pointerRoots(opts = {}) {
+  const roots = Array.isArray(opts.pointerRoots) && opts.pointerRoots.length
+    ? opts.pointerRoots
+    : ['memories/records', 'skills'];
+  return roots.map((r) => String(r).replace(/\\/g, '/').replace(/\/+$/, ''));
+}
+
+function resolvePointer(ptr, opts = {}) {
+  if (ptr.kind === 'skill') {
+    if (!opts.skillsRoot) return { ok: true };
+    return skillExists(opts.skillsRoot, ptr.target)
+      ? { ok: true }
+      : { ok: false, reason: 'dead_reference', detail: `引用了不存在的 skill：${ptr.target}` };
+  }
+  if (!opts.brainRoot) return { ok: true };
+  const rel = ptr.target;
+  if (rel.startsWith('/') || rel.includes('..')) {
+    return { ok: false, reason: 'dead_pointer', detail: `指针路径不合法：${rel}` };
+  }
+  const roots = pointerRoots(opts);
+  if (!roots.some((r) => rel === r || rel.startsWith(r + '/'))) {
+    return { ok: false, reason: 'dead_pointer', detail: `指针必须指向 ${roots.join(' 或 ')} 之下：${rel}` };
+  }
+  if (!fs.existsSync(path.join(opts.brainRoot, rel))) {
+    return { ok: false, reason: 'dead_pointer', detail: `指针指向的文件不存在：${rel}` };
+  }
+  return { ok: true };
+}
+
+function hardDomainHits(text) {
+  const hits = [];
+  for (const [re, label] of HARD_DOMAIN_PATTERNS) {
+    const m = re.exec(text);
+    if (!m) continue;
+    if (label === 'IP 地址') {
+      const octets = m[0].split('.').map(Number);
+      if (octets.some((o) => o > 255)) continue;   // 不是合法 IPv4（如版本号 1.2.3.400）
+    }
+    hits.push(label);
+  }
+  return hits;
+}
+
+function projectPileupHits(text, entries) {
+  if (!Array.isArray(entries) || entries.length === 0) return [];
+  const tokens = new Set(String(text || '').match(/\b[A-Z][A-Z0-9]{2,9}\b/g) || []);
+  const hits = [];
+  for (const tok of tokens) {
+    if (PILEUP_DENY.has(tok)) continue;
+    const count = entries.filter((e) => String(e).includes(tok)).length;
+    if (count >= PILEUP_THRESHOLD) hits.push(`${tok}×${count}`);
+  }
+  return hits;
+}
+
+// ---------------------------------------------------------------- 相似度 / 查重
 function bigrams(s) {
   const t = String(s).toLowerCase().replace(/\s+/g, '');
   const set = new Set();
@@ -66,7 +126,7 @@ function extractTopic(content) {
   return (m ? m[1] : cleaned.slice(0, 20)).trim();
 }
 
-// 递归找 skills 下名为 name 且含 SKILL.md 的目录（对应 MIS 的 rglob 版本）
+// 递归找 skills 下名为 name 且有 SKILL.md 的目录
 function skillExists(skillsRoot, name) {
   const direct = path.join(skillsRoot, name);
   try { if (fs.existsSync(path.join(direct, 'SKILL.md'))) return true; } catch {}
@@ -87,82 +147,95 @@ function skillExists(skillsRoot, name) {
   return false;
 }
 
+// 兼容旧调用：返回文本里所有指向不存在技能的引用
 function deadRefs(content, skillsRoot) {
-  const dead = [];
-  // Python 的 \w 匹配 Unicode；JS 默认只匹配 ASCII，这里显式带上中日韩字符
-  const re = /(?:详见|参见|见|see)\s+skill\s+[`]?([\p{L}\p{N}_-]+)/giu;
-  let m;
-  while ((m = re.exec(content)) !== null) {
-    const name = m[1];
-    if (!skillExists(skillsRoot, name)) dead.push(name);
-  }
-  return dead;
+  if (!skillsRoot) return [];
+  return findPointers(content).filter((p) => p.kind === 'skill' && !skillExists(skillsRoot, p.target)).map((p) => p.target);
 }
 
 function buildSuggestions(content, reason) {
-  const out = [];
-  const preview = content.slice(0, 40).replace(/'/g, '');
-  out.push({ action: 'shorten', hint: `压到一行索引（≤150 字），细节写进 skill；原文开头：${preview}` });
+  const preview = String(content).slice(0, 40).replace(/'/g, '');
+  const out = [{
+    action: 'shorten',
+    hint: `压成一行索引（≤150 字）+ 一个指针，原文开头：${preview}`,
+  }];
   if (reason === 'dead_reference') {
-    out.push({ action: 'create_skill', hint: '先建 skill，再写「见 skill <名字>」' });
+    out.push({ action: 'create_skill', hint: '先建技能，再写「见 skill <名字>」' });
+  } else if (reason === 'dead_pointer') {
+    out.push({ action: 'create_record', hint: '先把正文写成 memories/records/<域>/<主题>.md，再写「→ 该路径」' });
   } else {
-    out.push({ action: 'create_skill', hint: '用 skill_manage(action=create) 建 skill 放细节' });
+    out.push({ action: 'create_record', hint: '正文写进技能的 references/<类型>.md 或 memories/records/<域>/<主题>.md' });
   }
-  out.push({ action: 'force', hint: '确认这是必须留在记忆里的事实→强写（不推荐）' });
+  out.push({ action: 'force', hint: '确认这是必须留在记忆里的事实 → 强写（不推荐）' });
   return out;
 }
 
+// ---------------------------------------------------------------- 主判定
 // 返回 { ok:true } 或 { ok:false, reason, detail, suggestions }
 function checkPolicy(content, opts = {}) {
-  const maxLen = Number(opts.maxLen || 150);
-  const skillsRoot = opts.skillsRoot;
+  const shortMax = Number(opts.shortFactMax || 80);
+  const indexMax = Number(opts.maxLen || 150);
   const text = String(content || '').trim();
   if (!text) return { ok: false, reason: 'empty', detail: '内容为空' };
 
-  // 死引用优先于"短条目放行"：引用了不存在的 skill，多短都不该过
-  const deadAny = skillsRoot ? deadRefs(text, skillsRoot) : [];
-  if (deadAny.length) {
-    return { ok: false, reason: 'dead_reference', detail: `引用了不存在的 skill: ${deadAny.join(', ')}`, suggestions: buildSuggestions(text, 'dead_reference') };
+  // 硬规则先行：凭据 / IP / 端口无条件拒，索引行也不放行
+  const hard = hardDomainHits(text);
+  if (hard.length) {
+    return {
+      ok: false, reason: 'domain_details',
+      detail: `含敏感内容（${hard.join('、')}）：凭据 / IP / 端口必须进正文文件，记忆里一行都不留`,
+      suggestions: buildSuggestions(text, 'domain_details'),
+    };
   }
 
-  if (INDEX_LINE_RE.test(text)) {
-    return { ok: true };
-  }
+  const pointers = findPointers(text);
 
-  // 结构化内容不设长度豁免：3 行 bullet 再短也是"细节"，MIS 的 <50 放行是漏网
-  for (const [re, label] of REFERENCE_PATTERNS) {
-    if (re.test(text)) {
-      return { ok: false, reason: 'structured_content', detail: `结构化内容（${label}）应写进 skill`, suggestions: buildSuggestions(text, 'structured') };
+  // ② 索引行：单行、一个指针、可解析
+  if (pointers.length === 1) {
+    if (/\r?\n/.test(text)) {
+      return { ok: false, reason: 'structured_content', detail: '索引行必须是单行：多行内容属于正文', suggestions: buildSuggestions(text, 'structured') };
     }
-  }
-
-  if (text.length < 50) return { ok: true };
-
-  const segments = text.split(/[、，,；;]\s*/).filter((s) => s.length > 2);
-  if (segments.length >= 3 && text.length > 100) {
-    return { ok: false, reason: 'too_many_points', detail: `${segments.length} 个细节点 / ${text.length} 字，应进 skill`, suggestions: buildSuggestions(text, 'too_many_points') };
-  }
-
-  const hits = [];
-  for (const [re, label] of DOMAIN_PATTERNS) if (re.test(text)) hits.push(label);
-  if (hits.length && text.length > 100) {
-    return { ok: false, reason: 'domain_details', detail: `含项目细节（${hits.slice(0, 3).join(', ')}），应进 skill`, suggestions: buildSuggestions(text, 'domain_details') };
-  }
-
-  if (text.length > 200) {
-    return { ok: false, reason: 'too_long', detail: `过长（${text.length} 字 > 200）`, suggestions: buildSuggestions(text, 'too_long') };
-  }
-  if (text.length > maxLen) {
-    for (const [re, label] of REFERENCE_PATTERNS) {
-      if (re.test(text)) {
-        return { ok: false, reason: 'long_and_structured', detail: `既长（${text.length}）又结构化（${label}）`, suggestions: buildSuggestions(text, 'long_structured') };
-      }
+    const cp = Array.from(text).length;
+    if (cp > indexMax) {
+      return { ok: false, reason: 'too_long', detail: `索引行 ${cp} 字符，上限 ${indexMax}`, suggestions: buildSuggestions(text, 'too_long') };
     }
+    const res = resolvePointer(pointers[0], opts);
+    if (!res.ok) {
+      return { ok: false, reason: res.reason, detail: res.detail, suggestions: buildSuggestions(text, res.reason) };
+    }
+    return { ok: true, shape: 'index', pointer: pointers[0] };
   }
-  return { ok: true };
+
+  if (pointers.length > 1) {
+    return { ok: false, reason: 'structured_content', detail: `一条索引最多一个指针，当前 ${pointers.length} 个`, suggestions: buildSuggestions(text, 'structured') };
+  }
+
+  // ① 短自包含事实：单行、够短
+  if (/\r?\n/.test(text)) {
+    return { ok: false, reason: 'unindexed_detail', detail: '多行内容没有指针：正文应进 references/ 或 memories/records/，记忆只留一行', suggestions: buildSuggestions(text, 'unindexed_detail') };
+  }
+  const cp = Array.from(text).length;
+  if (cp > shortMax) {
+    return {
+      ok: false, reason: 'unindexed_detail',
+      detail: `${cp} 字符且无指针：超过短事实上限 ${shortMax}，请拆成「一行索引 + 正文文件」`,
+      suggestions: buildSuggestions(text, 'unindexed_detail'),
+    };
+  }
+
+  const pile = projectPileupHits(text, opts.existingEntries);
+  if (pile.length) {
+    return {
+      ok: false, reason: 'project_pileup',
+      detail: `项目细节堆积（${pile.join(', ')}）——该项目在记忆里已有 ≥${PILEUP_THRESHOLD} 条，细节应进正文文件，记忆只留一行索引`,
+      suggestions: buildSuggestions(text, 'project_pileup'),
+    };
+  }
+
+  return { ok: true, shape: 'short_fact' };
 }
 
-// 跨 MEMORY/USER 查重：主题相同，或（双方 >60 字且相似度 >0.6）
+// 跨文件查重：主题相同，或（双方 >60 字且相似度 >0.6）
 function findDuplicate(content, entriesByTarget, excludeOld = '') {
   const text = String(content || '').trim();
   if (!text) return null;
@@ -202,4 +275,16 @@ function findDuplicate(content, entriesByTarget, excludeOld = '') {
   return null;
 }
 
-module.exports = { checkPolicy, findDuplicate, similarity, extractTopic, deadRefs, skillExists, INDEX_LINE_RE };
+module.exports = {
+  checkPolicy,
+  findDuplicate,
+  findPointers,
+  resolvePointer,
+  pointerRoots,
+  similarity,
+  extractTopic,
+  deadRefs,
+  skillExists,
+  hardDomainHits,
+  projectPileupHits,
+};

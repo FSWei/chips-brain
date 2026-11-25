@@ -83,8 +83,30 @@ node ~/agent-brain/.brain/bin/brain.js status
 | `list` / `search` | 列出 / 检索（含归档层） |
 | `pending` | 查看被拒的写入（落盘，不随进程丢失） |
 | `resolve --id N --choice force\|drop` | 处理待定违规 |
+| `applyOps --ops-json '<[ops]>'` | 原子批量：同一把锁内全部校验通过才落盘，任一条失败整批不改 |
+| `audit` / `doctor` | 看审计尾部 / 只读体检（预算、每条形状、技能体积） |
 
 所有命令输出 JSON，`--file MEMORY|USER` 指定目标，`--force` 跳过策略（仍绕不过密钥与预算）。
+
+## 一条记忆的三种合法形状
+
+写入闸只接受这三种，其余一律拒绝并给出 `suggestions`：
+
+| 形状 | 判据 | 例子 |
+|---|---|---|
+| **短事实** | 单行、自包含、≤ `short_fact_max`（默认 80 字） | `Git 提交身份统一 …` |
+| **指针行** | 一句话结论 + 一个指针，指针必须真实存在且在 `pointer.roots` 下 | `… 见 skill chips-brain` / `… → memories/records/hw/pinout.md` |
+| **画像** | 仅 `USER.md`，`short_fact_max=200` 的自包含描述 | 一段人设/偏好 |
+
+多行、bullet、箭头链、表格、一个以上指针 → `structured_content` / `unindexed_detail`；正文去 `references/` 或 `memories/records/`，记忆只留一行。
+
+## 配套脚本
+
+| 脚本 | 作用 |
+|---|---|
+| `kernel/bin/skill-log.js` | 给非 DSH 宿主（Hermes）的技能写入补 DSH 兼容记录：blob + 索引 + 审计 |
+| `kernel/bin/skill-split.js` | 把 SKILL.md 的 H2 章节搬进 `references/`，带快照与标题保真检查、支持 `--dry-run` |
+| `scripts/churn-report.py` | 技能改动体检：近 N 小时每技能写入数 / 后台次数 / 整篇重写迹象，超阈值 WARN/ALERT |
 
 ## 规则（`rules.yaml`）
 
